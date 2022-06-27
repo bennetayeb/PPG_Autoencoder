@@ -1,224 +1,241 @@
 import codecs
 import argparse
 import os
+
+import matplotlib.pyplot as plt
 import tqdm
 import numpy
 import glob
-from sklearn import model_selection
+from sklearn.model_selection import train_test_split, cross_val_score, validation_curve
 import torch
 import torch.nn as nn
 import torch.nn.utils.rnn
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 from torch.autograd import Variable
+from torch.optim.lr_scheduler import ExponentialLR
+import codecs
 from torchsummary import summary
 from torchshape import tensorshape
 from pprint import pprint
-from collections import OrderedDict
 from torch.utils.tensorboard import SummaryWriter
 
-# def dowloadDtataset():
-#     trainDtata =
-#     validationData =
-#     return trainDtata, validationData
+hyper = {
+    "randomSeed": 42,
+    "nEpochs":70,
+    "PATH": "model.pt",
+    "batchSize":4,
+    "lr":1e-3,
+    "clip_grad":0.1,
 
+}
+torch.manual_seed(hyper["randomSeed"]);
+device = torch.device("cpu")
+
+
+filename = 'data.txt'
+dir_fpath = '/home/rania/Documents/workspace/IntraSpkVC/data_fr/ppg/FFR0009'
+file_list = glob.glob(dir_fpath + '/*.npy')
+# print(len(file_list))
+data = []
+vectorLengths = []
+for idx, s in enumerate(file_list):
+    vector = numpy.load(s)
+    data.append(torch.tensor(vector))
+    data.sort(key=len)
+    vectorLengths.append(len(vector))
+    vectorLengths.sort()
+
+class Dataset(Dataset):
+    def __init__(self, data):
+        # self.vectorLengths = vectorLengths
+        # self.data = data
+        self.data = pad_sequence(data, batch_first=True, padding_value=0)
+
+    def __getitem__(self, idx):
+        x = self.data[idx].clone().detach().requires_grad_(True)
+        x = torch.unsqueeze(x, 0)
+        return x
 
 class CustomDataset(Dataset):
     def __init__(self, data):
-        #order before padding
-        # self.data = OrderedDict()
+        # self.vectorLengths = vectorLengths
         self.data = data
-        self.data = pad_sequence(data, batch_first=True, padding_value=0)
 
     def __len__(self):
-        # lenghts od data frames
+        #or use input_lengths
+        # print(self.vactorLengths)
         return len(self.data)
 
     def __getitem__(self, idx):
-        audio_sample_path = self._get_audio_sample_path(idx)
         x = self.data[idx].clone().detach().requires_grad_(True)
-        return torch.unsqueeze(x, 0)
+        # x = torch.unsqueeze(x, 0)
+        return x
 
-def collate_fn_padd(batch):
-    print(type(batch))
-    print(len(batch))
+dataPadded = Dataset(data=data)
+
+trainDataX, testDataX,trainDataY, testDataY = train_test_split([data for data in dataPadded ],[data for data in dataPadded ],test_size=0.2,random_state=41,shuffle=False,stratify=None)
+# print("size of the training dataset {}".format(len(trainDataX)), trainDataX[2].shape)
+# print("size of the training dataset {}".format(len(trainDataX)), trainDataX[3].shape)
+valDataX, testDataX, valDataY, testDataY = train_test_split(testDataX,testDataY,test_size=0.5,random_state=41,shuffle=False,stratify=None)
+# print("size of the validation dataset {}".format(len(valDataX)), valDataY[0].shape)
+# print("size of the validation dataset {}".format(len(valDataX)), valDataY[1].shape)
+
+def masking(data):
+    pad = 0
+    dataMask = (data == pad).type(torch.int16)
+    dataMask = 1 - dataMask
+    maskedData = torch.mul(dataMask, data)
+    return maskedData
+
+def train(trainLoader, model, criterion, optimizer,epoch =hyper["nEpochs"]):
+    model.train()
+    totalLoss, batchNum = 0, 0
+    for i, trainData in enumerate(trainLoader):
+        trainData = Variable(trainData).to(device)
+        # ===================forward=====================
+        output = model(trainData)
+        loss = criterion(masking(output), trainData)
+        # print(loss)
+        # ===================backward====================
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        optimizer.step()
+        totalLoss += loss.item()
+        batchNum += 1
+    trainTotalCount = totalLoss / batchNum
+    # ===================log========================
+    print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, epoch, trainTotalCount))
+    return trainTotalCount
+
+def valid(valLoader, model, criterion, epoch=hyper["nEpochs"]):
+    model.eval()
+    with torch.no_grad():
+        totalLoss, batchNum = 0, 0
+        for i, valData in enumerate(valLoader):
+            valData = Variable(valData).to(device)
+            # ===================forward=====================
+            output = model(valData)
+            loss = criterion(masking(output), valData)
+            totalLoss += loss.item()
+            batchNum += 1
+        ValTotalCount = totalLoss / batchNum
+    print('epoch [{}/{}], Validation loss:{:.4f}'.format(epoch + 1, epoch, ValTotalCount))
+    return ValTotalCount
 
 
+class SaveBestModel:
+    """
+    Class to save the best model while training. If the current epoch's
+    validation loss is less than the previous least less, then save the
+    model state.
+    """
 
+    def __init__(
+            self, bestValidLoss = float('inf')
+    ):
+        self.bestValidLoss = bestValidLoss
+
+    def __call__(
+            self, currentValidLoss,
+            epoch, model, optimizer, criterion
+    ):
+        if currentValidLoss < self.bestValidLoss:
+            self.bestValidLoss = currentValidLoss
+            print(f"\nBest validation loss: {self.bestValidLoss}")
+            print(f"\nSaving best model for epoch: {epoch + 1}\n")
+            torch.save({
+                'epoch': hyper["nEpochs"] + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': criterion,
+            }, 'outputs/best_model.pth')
+saveBestModel = SaveBestModel()
+
+def save_model(model, optimizer, criterion, epochs=hyper["nEpochs"]):
+    """
+    Function to save the trained model
+    """
+    print(f"Saving final model...")
+    torch.save({
+        'epoch': epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': criterion,
+    }, 'outputs/final_model.pth')
 
 
 class Autoencoder(nn.Module):
     def __init__(self):
-        super(Autoencoder, self).__init__()
-        image_size = (4, 1, 28, 28)
+        super().__init__()
         self.encoder = nn.Sequential(
-            # nn.Conv2d(1, 16, 3, stride=3, padding=1),  # b, 16, 10, 10
-            # nn.ReLU(True),
-            # nn.MaxPool2d(2, stride=2),  # b, 16, 5, 5
-           # nn.Conv2d(16, 8, 3, stride=2, padding=1),  # b, 8, 3, 3
-            # nn.ReLU(True),
-            #nn.MaxPool2d(2, stride=1)  # b, 8, 2, 2
-
-            # Input : b, 1, 28,28
-            nn.Conv2d(1, 16, 3, stride=1, padding="same"),  # b, 16, 28, 28
-            #print(tensorshape(nn.Conv2d(1, 16, 3, stride=1, padding="same"), image_size)),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, stride=2),  # b, 16, 14, 14
-            #print(tensorshape(nn.MaxPool2d(2, stride=2), image_size)),
-
+            nn.Conv2d(1, 16, 3, stride=2, padding=1),  # b, 16, 1768, 14
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),  # b,  32, 884, 7
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 7),  # b, 64, 878, 1
         )
         self.decoder = nn.Sequential(
-            # #nn.ConvTranspose2d(8, 16, 3, stride=2),  # b, 16, 5, 5
-            # #nn.ReLU(True),
-            # nn.ConvTranspose2d(16, 8, 5, stride=3, padding=1),  # b, 8, 15, 15
-            # nn.ReLU(True),
-            # nn.ConvTranspose2d(8, 1, 2, stride=2, padding=1),  # b, 1, 28, 28
-            # nn.Tanh()
-            # nn.ConvTranspose2d(8, 16, 3, stride=3, padding=4), # b, 16, 14, 14
-            nn.ConvTranspose2d(16, 1, 2, stride=2), # b, 1, 28, 28
-            nn.Tanh(),
+            nn.ConvTranspose2d(64, 32, 7),  # b, 32, 884, 7
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1,  output_padding=1),  # b, 16, 1768, 14
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, 3, stride=2, padding=1, output_padding=1),  # b, 1, 3536, 28
+            nn.Sigmoid()
         )
-
     def forward(self, x):
         x = self.encoder(x)
         x = self.decoder(x)
         return x
 
-
-def getData():
-    filename = 'data.txt'
-    dir_fpath = '/home/rania/Documents/workspace/IntraSpkVC/data_fr/ppg/FFR0009'
-    file_list = glob.glob(dir_fpath + '/*.npy')[:10]
-    # print(file_list)
-
-    vectors = []
-    input_lengths = []
-
-    for i, s in enumerate(file_list):
-        vector = numpy.load(s)
-        input_lengths.append(len(vector))
-        vectors.append(torch.tensor(vector))
-        vectors.sort(key=len)
-    #   print(type(vectors))
-    # print(numpy.shape(vectors[0]))
-    # print(numpy.shape(vectors[1]))
-    # print(numpy.shape(vectors[2]))
-    return vectors, input_lengths
-vectors, _ = getData()
-_, input_lengths = getData()
-print(type(vectors))
-
-
-def maskLoss(data, output, dataMask, outputMask):
-    # non zero elmement present
-    nTotalData = dataMask.sum()
-    nTotalOutput = outputMask.sum()
-    output = torch.tensor(output, dtype=torch.int64)
-    gathered_tensors = torch.gather(data, 2, output)
-    # calculate negative likelihood Loss
-    crossEntropy = -torch.log(gathered_tensors)
-    # slect non zero elemnt
-    loss = crossEntropy.masked_select(dataMask)
-    # calculate the mean of the loss
-    loss = loss.mean()
-    loss = loss.to(device='cpu')
-    return loss   # ,nTotalData.item()
-
-
 def main():
-    # Each sample will be retrieved by indexing tensors along the first dimension.
-    # dataset = TensorDataset(CustomDataset(data=vectors))
+    datasetTrain = CustomDataset(data=trainDataX)
+    trainLoader = DataLoader(datasetTrain,
+                             batch_size=hyper["batchSize"],
+                             shuffle=True
+                             )
+    # for i, data in enumerate(trainLoader):
+    #     print('train', data.shape)
+    datasetVal = CustomDataset(data=valDataX)
 
-    dataset = CustomDataset(data=vectors)
+    valLoader = DataLoader(datasetVal,
+                           batch_size=hyper["batchSize"],
+                           shuffle=True
+                           )
+    # for i, data in enumerate(valLoader):
+    #     print('val ', data.shape)
+    model = Autoencoder().to(device)
+    # model = summary(model, (1, 3536, 28))
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(params=model.parameters(),
+                                 lr=hyper["lr"],
+                                 weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.1)
 
-    dataLoader = DataLoader(dataset,
-                            batch_size=4,
-                            shuffle=False,
-                            )
-    # dataset= numpy.asarray(dataset)
-    #print('dataset 0 shape: ', dataset[0].shape)
-    #print(len(dataset))
-    # for data in dataLoader:
-    #     print(data.shape)
-    #     break
+    for epoch in range(hyper["nEpochs"]):
+        print(f"[INFO]: Epoch {epoch} of {hyper['nEpochs']}")
+        # # ===================training========================
+        trainEpochLoss = train(trainLoader, model, criterion, optimizer, epoch)
+        # # ===================validation========================
+        validEpochLoss = valid(valLoader, model, criterion, epoch)
+        # # ===================checkpoints========================
+        trainLoss, validLoss = [], []
+        # start the training
+        trainLoss.append(trainEpochLoss)
+        validLoss.append(validEpochLoss)
 
-
-
-
-
-    #print(f"length dataLoader: {len(dataLoader)}")
-    # print("type dataloader:", type(dataLoader))
-
-    num_epochs = 5
-    learning_rate = 1e-3
-
-    model = Autoencoder().to(device='cpu')
-    #model = summary(model, (1, 28, 28))
-
-    # criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=1e-5)
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-        batch_num=0
-        pad = 0
-        for i,data in enumerate(dataLoader):
-            pad = 0
-            print('data', data.shape)
-            data = Variable(data)
-            dataMask = (data == pad)  # .type(torch.int16)
-            # dataMask = 1 - dataMask
-            dataMask = ~dataMask
-            print('dataMask', dataMask.shape)
-
-            # maskedData = torch.mul(dataMask, data)
-            # print('maskedData', maskedData.shape)
-            # maskedData = Variable(maskedData)
-
-            # # ===================forward=====================
-
-            output = model(data)
-            outputMask = (output == pad).type(torch.int16)
-            outputMask = 1 - outputMask
-
-            # maskedOutput = torch.mul(outputMask, output)
-            loss = maskLoss(data, output, dataMask, outputMask)
-            print('loss', loss)
-
-            # # ===================backward====================
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            batch_num += 1
-
-            # # ===================log========================
-
-        print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, num_epochs, total_loss/batch_num))
-
-
-        torch.save(model.state_dict(), './conv_autoencoder.pth')
+        print(f"Training loss: {trainEpochLoss:.3f}")
+        print(f"Validation loss: {validEpochLoss:.3f}")
+        # save the best model till now if we have the least loss in the current epoch
+        saveBestModel(
+            validEpochLoss, epoch, model, optimizer, criterion
+        )
+        # save the trained model weights for a final time
+        save_model(model, optimizer, criterion, epoch)
+        print('TRAINING COMPLETE')
 
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
