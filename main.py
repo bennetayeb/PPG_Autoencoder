@@ -9,24 +9,42 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.rnn
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torch.autograd import Variable
 from torchsummary import summary
 from torchshape import tensorshape
 from pprint import pprint
+from collections import OrderedDict
+from torch.utils.tensorboard import SummaryWriter
+
+# def dowloadDtataset():
+#     trainDtata =
+#     validationData =
+#     return trainDtata, validationData
 
 
 class CustomDataset(Dataset):
     def __init__(self, data):
+        #order before padding
+        # self.data = OrderedDict()
+        self.data = data
         self.data = pad_sequence(data, batch_first=True, padding_value=0)
 
     def __len__(self):
-        #or use input_lengths
+        # lenghts od data frames
         return len(self.data)
 
     def __getitem__(self, idx):
+        audio_sample_path = self._get_audio_sample_path(idx)
         x = self.data[idx].clone().detach().requires_grad_(True)
         return torch.unsqueeze(x, 0)
+
+def collate_fn_padd(batch):
+    print(type(batch))
+    print(len(batch))
+
+
+
 
 
 class Autoencoder(nn.Module):
@@ -80,33 +98,49 @@ def getData():
         vector = numpy.load(s)
         input_lengths.append(len(vector))
         vectors.append(torch.tensor(vector))
-    # print(numpy.shape(vectors))
-    # print(numpy.shape(vectors[6]))
-    # print(numpy.shape(vectors[6][0]))
-    return vectors
-vectors = getData()
+        vectors.sort(key=len)
+    #   print(type(vectors))
+    # print(numpy.shape(vectors[0]))
+    # print(numpy.shape(vectors[1]))
+    # print(numpy.shape(vectors[2]))
+    return vectors, input_lengths
+vectors, _ = getData()
+_, input_lengths = getData()
+print(type(vectors))
 
 
-def binaryMatrix(l, value=0):
-    m = []
-    for i, seq in enumerate(l):
-        m.append([])
-        for token in seq:
-            if token == 0:
-                m[i].append(0)
-            else:
-                m[i].append(1)
-    return m
-
+def maskLoss(data, output, dataMask, outputMask):
+    # non zero elmement present
+    nTotalData = dataMask.sum()
+    nTotalOutput = outputMask.sum()
+    output = torch.tensor(output, dtype=torch.int64)
+    gathered_tensors = torch.gather(data, 2, output)
+    # calculate negative likelihood Loss
+    crossEntropy = -torch.log(gathered_tensors)
+    # slect non zero elemnt
+    loss = crossEntropy.masked_select(dataMask)
+    # calculate the mean of the loss
+    loss = loss.mean()
+    loss = loss.to(device='cpu')
+    return loss   # ,nTotalData.item()
 
 
 def main():
+    # Each sample will be retrieved by indexing tensors along the first dimension.
+    # dataset = TensorDataset(CustomDataset(data=vectors))
+
     dataset = CustomDataset(data=vectors)
-    dataLoader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+    dataLoader = DataLoader(dataset,
+                            batch_size=4,
+                            shuffle=False,
+                            )
     # dataset= numpy.asarray(dataset)
     #print('dataset 0 shape: ', dataset[0].shape)
     #print(len(dataset))
-
+    # for data in dataLoader:
+    #     print(data.shape)
+    #     break
 
 
 
@@ -118,13 +152,12 @@ def main():
     num_epochs = 5
     learning_rate = 1e-3
 
-
     model = Autoencoder().to(device='cpu')
     #model = summary(model, (1, 28, 28))
 
-    criterion = nn.MSELoss()
-
+    # criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=1e-5)
+
     for epoch in range(num_epochs):
         total_loss = 0
         batch_num=0
@@ -133,29 +166,31 @@ def main():
             pad = 0
             print('data', data.shape)
             data = Variable(data)
-            dataMask = (data == pad).type(torch.int16)
-            dataMask = 1 - dataMask
+            dataMask = (data == pad)  # .type(torch.int16)
+            # dataMask = 1 - dataMask
+            dataMask = ~dataMask
             print('dataMask', dataMask.shape)
 
-            maskedData = torch.mul(dataMask, data)
-            print('maskedData', maskedData.shape)
-            maskedData = Variable(maskedData)
+            # maskedData = torch.mul(dataMask, data)
+            # print('maskedData', maskedData.shape)
+            # maskedData = Variable(maskedData)
 
             # # ===================forward=====================
 
-            output = model(maskedData)
+            output = model(data)
             outputMask = (output == pad).type(torch.int16)
             outputMask = 1 - outputMask
-            maskedOutput = torch.mul(outputMask, output)
-            loss = criterion(maskedOutput, maskedData)
-            #print(loss)
+
+            # maskedOutput = torch.mul(outputMask, output)
+            loss = maskLoss(data, output, dataMask, outputMask)
+            print('loss', loss)
 
             # # ===================backward====================
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total_loss += loss.data
+            total_loss += loss.item()
             batch_num += 1
 
             # # ===================log========================
@@ -163,8 +198,27 @@ def main():
         print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, num_epochs, total_loss/batch_num))
 
 
-        #torch.save(model.state_dict(), './conv_autoencoder.pth')
+        torch.save(model.state_dict(), './conv_autoencoder.pth')
 
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
